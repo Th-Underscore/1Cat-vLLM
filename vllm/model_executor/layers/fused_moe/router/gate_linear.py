@@ -3,6 +3,7 @@
 import torch
 from torch.nn.parameter import Parameter
 
+import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -58,6 +59,11 @@ class GateLinear(ReplicatedLinear):
         )
         self.out_dtype = out_dtype
         self._sm70_dsv4_fp13_gemv = True
+        # Pre-compute env var checks so forward() is dynamo-traceable
+        self._sm70_gemv_enabled = (
+            envs.VLLM_SM70_DSV4_FP16_GEMV
+            or envs.VLLM_SM70_DSV4_FP13_GEMV
+        )
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
@@ -94,37 +100,35 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        import vllm._custom_ops as ops
+        # C-extension tiers (eager only; not traceable by dynamo fullgraph)
+        if not torch.compiler.is_compiling():
+            if self._sm70_gemv_enabled and self.out_dtype is not None:
+                from vllm.models.deepseek_v4.sm70.gemv import (
+                    maybe_sm70_dsv4_fp16_gemv,
+                )
 
-        if (
-            envs.VLLM_SM70_DSV4_FP16_GEMV or envs.VLLM_SM70_DSV4_FP13_GEMV
-        ) and self.out_dtype is not None:
-            from vllm.models.deepseek_v4.sm70.gemv import (
-                maybe_sm70_dsv4_fp16_gemv,
-            )
+                output = maybe_sm70_dsv4_fp16_gemv(
+                    x,
+                    self.weight,
+                    self.out_dtype,
+                    getattr(self, "_sm70_dsv4_fp13_weight", None),
+                )
+                if output is not None:
+                    return output, None
 
-            output = maybe_sm70_dsv4_fp16_gemv(
-                x,
-                self.weight,
-                self.out_dtype,
-                getattr(self, "_sm70_dsv4_fp13_weight", None),
-            )
-            if output is not None:
+            # Tier 1: DSV3 specialized kernel
+            if self.allow_dsv3_router_gemm and x.shape[0] <= 16:
+                output = ops.dsv3_router_gemm(
+                    hidden_states=x,
+                    router_weight=self.weight,
+                    output_dtype=self.out_dtype,
+                )
                 return output, None
 
-        # Tier 1: DSV3 specialized kernel
-        if self.allow_dsv3_router_gemm and x.shape[0] <= 16:
-            output = ops.dsv3_router_gemm(
-                hidden_states=x,
-                router_weight=self.weight,
-                output_dtype=self.out_dtype,
-            )
-            return output, None
-
-        # Tier 2: cuBLAS bf16→fp32
-        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
-            return output, None
+            # Tier 2: cuBLAS bf16→fp32
+            if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+                return output, None
 
         # Tier 3: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
