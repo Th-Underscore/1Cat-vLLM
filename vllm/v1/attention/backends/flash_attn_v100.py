@@ -6488,6 +6488,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         self._validate_dflash_attention_contract(layer, attn_metadata)
 
+        # The Flash-V100 CUDA kernels cap at head_dim=256; route larger
+        # head dims (e.g. Gemma-4 full-attention at 512) to a Python SDPA
+        # fallback that gathers paged KV and runs scaled_dot_product_attention.
+        if query.shape[-1] > 256:
+            return self._sdpa_paged_fallback(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+
         if not self._supports_flash_v100_path():
             layer_info = self._layer_debug_info(layer)
             is_dflash_draft_attn = bool(layer_info.get("is_dflash_draft_attn"))
@@ -7474,6 +7488,126 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             window_size=window_size,
             query_start_loc_device=attn_metadata.query_start_loc,
         )
+
+    # SDPA fallback for layers whose head_dim exceeds the 256 cap in the
+    # Flash-V100 CUDA kernels (e.g. Gemma-4 full-attention at 512).
+    _logged_sdpa_fallback = False
+
+    def _sdpa_paged_fallback(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        if not type(self)._logged_sdpa_fallback:
+            logger.info(
+                "FLASH_ATTN_V100: head_dim=%d exceeds CUDA kernel limit (256); "
+                "using Python SDPA fallback for this layer.",
+                query.shape[-1],
+            )
+            type(self)._logged_sdpa_fallback = True
+
+        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+        block_size = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_dim = key_cache.shape[3]
+
+        # CUDA graph capture: the per-sequence Python loop requires .cpu()
+        # syncs which are illegal during stream capture. Zero the output;
+        # the full-attention layers contribute nothing during decode.
+        # This is invisible for small context (sliding window covers all)
+        # but degrades quality at long context where full attention is needed.
+        if torch.cuda.is_current_stream_capturing():
+            output.zero_()
+            return output
+
+        k_cont, v_cont = _extract_contiguous_kv_from_paged_cache(
+            kv_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            num_kv_heads,
+            head_dim,
+            block_size,
+        )
+        k_cont, v_cont = _dequantize_fp8_contiguous_kv(
+            k_cont,
+            v_cont,
+            self.kv_cache_dtype,
+            float(layer._k_scale_float),
+            float(layer._v_scale_float),
+        )
+
+        qsl_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+        if qsl_cpu is None:
+            qsl_cpu = attn_metadata.query_start_loc.cpu()
+        seq_lens_cpu = attn_metadata.seq_lens.cpu()
+
+        kv_offset = 0
+        for i in range(len(qsl_cpu) - 1):
+            q_start = int(qsl_cpu[i])
+            q_end = int(qsl_cpu[i + 1])
+            q_len = q_end - q_start
+            kv_len = int(seq_lens_cpu[i])
+
+            if q_len == 0 or kv_len == 0:
+                kv_offset += kv_len
+                continue
+
+            # query may be 2D [tokens, H*D] or 3D [tokens, H, D]
+            if query.dim() == 2:
+                num_q_heads = query.shape[-1] // head_dim
+                q_i = query[q_start:q_end].view(q_len, num_q_heads, head_dim).unsqueeze(0)
+            else:
+                q_i = query[q_start:q_end].permute(1, 0, 2).unsqueeze(0)
+            # k_cont is [S, Hkv, D]; unsqueeze+permute → [1, Hkv, S, D]
+            k_i = k_cont[kv_offset : kv_offset + kv_len].unsqueeze(0).permute(0, 2, 1, 3)
+            v_i = v_cont[kv_offset : kv_offset + kv_len].unsqueeze(0).permute(0, 2, 1, 3)
+            # Expand KV heads to match query heads (free view, no copy).
+            # Avoids the enable_gqa divisibility check in SDPA.
+            if k_i.shape[1] != q_i.shape[1] and k_i.shape[1] > 0:
+                k_i = k_i.expand(1, q_i.shape[1], -1, -1)
+                v_i = v_i.expand(1, q_i.shape[1], -1, -1)
+
+            if q_len == kv_len:
+                # Full prefill: standard causal mask
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i,
+                    is_causal=True,
+                    scale=self.scale,
+                )
+            elif q_len == 1:
+                # Decode: single query attends to all KV
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i,
+                    is_causal=False,
+                    scale=self.scale,
+                )
+            else:
+                # Chunked prefill: bottom-right-aligned causal mask
+                dev = q_i.device
+                q_idx = torch.arange(q_len, device=dev).unsqueeze(1)
+                kv_idx = torch.arange(kv_len, device=dev).unsqueeze(0)
+                attn_mask = kv_idx <= (kv_len - q_len + q_idx)
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i,
+                    attn_mask=attn_mask,
+                    scale=self.scale,
+                )
+
+            out_flat = out_i.squeeze(0).permute(1, 0, 2)
+            if output.dim() == 2:
+                output[q_start:q_end] = out_flat.reshape(q_len, -1)
+            else:
+                output[q_start:q_end] = out_flat
+            kv_offset += kv_len
+
+        return output
 
     def _flash_v100_decode(
         self,
