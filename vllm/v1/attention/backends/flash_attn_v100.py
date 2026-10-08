@@ -5029,6 +5029,8 @@ def prepare_dflash2_smallq_group_metadata(
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
+    _logged_sdpa_dense: bool = False
+
     def __init__(self, *args, **kwargs):
         self.prefix_anchored_decode_window = kwargs.pop(
             "prefix_anchored_decode_window", None
@@ -5154,6 +5156,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         paged_prefill_disable = (
             os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
         )
+        # D=512 graph-safe dense SDPA path: the native paged prefill kernel
+        # has a multi-block correctness bug, so D=512 layers use dense SDPA
+        # with a pre-allocated fixed-shape buffer (graph-safe for decode).
+        self._sdpa_dense_enabled = head_size > 256
+        self._sdpa_dense_max_seq: int = 0  # set on first forward call
         self.use_flash_v100_prefill_paged = (
             self.flash_attn_prefill_paged is not None
             and paged_prefill_enable != "0"
@@ -6467,6 +6474,170 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return max_query_len <= self.smallq_decode_max_query_len and model_len_supported
 
+    def _sdpa_dense_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Graph-safe dense SDPA for D=512 decode.
+
+        Gathers paged KV into a fixed-shape dense buffer, builds a 1D
+        length mask from seq_lens (GPU tensor, no CPU sync), and calls
+        F.scaled_dot_product_attention. All shapes are fixed at capture
+        time; only the mask values change on replay.
+        """
+        import torch.nn.functional as F
+
+        if not type(self)._logged_sdpa_dense:
+            logger.info(
+                "FLASH_ATTN_V100: head_dim=%d using graph-safe dense SDPA "
+                "(native paged kernel has multi-block bug).",
+                self.head_size,
+            )
+            type(self)._logged_sdpa_dense = True
+
+        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+        # key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        block_size = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_dim = key_cache.shape[3]
+        num_heads = self.num_heads
+
+        # Gather paged KV → dense: [batch, max_blocks, bs, hkv, d]
+        block_table = attn_metadata.block_table  # [batch, max_blocks]
+        k_dense = key_cache[block_table]  # [batch, max_b, bs, hkv, d]
+        v_dense = value_cache[block_table]  # [batch, max_b, bs, hkv, d]
+
+        # Dequantize FP8 KV while still contiguous (view requires contig)
+        k_dense, v_dense = _dequantize_fp8_contiguous_kv(
+            k_dense, v_dense, self.kv_cache_dtype,
+            float(layer._k_scale_float), float(layer._v_scale_float),
+        )
+
+        # Reshape: [batch, max_b*bs, hkv, d] → [batch, hkv, max_seq, d]
+        max_seq = k_dense.shape[1] * k_dense.shape[2]
+        k_dense = k_dense.reshape(k_dense.shape[0], max_seq, num_kv_heads, head_dim)
+        v_dense = v_dense.reshape(v_dense.shape[0], max_seq, num_kv_heads, head_dim)
+        k_dense = k_dense.permute(0, 2, 1, 3).contiguous()  # [batch, hkv, max_seq, d]
+        v_dense = v_dense.permute(0, 2, 1, 3).contiguous()
+        k_dense = k_dense.to(query.dtype)
+        v_dense = v_dense.to(query.dtype)
+
+        # Length mask: [batch, max_seq] (GPU tensor, graph-safe)
+        seq_lens = attn_metadata.seq_lens  # [batch]
+        mask = (
+            torch.arange(max_seq, device=query.device, dtype=torch.int32).unsqueeze(0)
+            < seq_lens.unsqueeze(1)
+        )  # [batch, max_seq]
+
+        # Reshape query: [total_tokens, H*D] → [batch, H, 1, D]
+        batch_size = query.shape[0]
+        q = query.reshape(batch_size, num_heads, 1, head_dim)
+
+        # Expand KV heads for GQA (free view)
+        if num_kv_heads != num_heads:
+            rep = num_heads // num_kv_heads
+            k_dense = k_dense.repeat_interleave(rep, dim=1)
+            v_dense = v_dense.repeat_interleave(rep, dim=1)
+
+        # SDPA with mask: [batch, H, 1, D] x [batch, H, max_seq, D]
+        out = F.scaled_dot_product_attention(
+            q, k_dense, v_dense,
+            attn_mask=mask.unsqueeze(1).unsqueeze(2),  # [batch, 1, 1, max_seq]
+            scale=self.scale,
+        )  # [batch, H, 1, D]
+
+        # Reshape output: [batch, H, 1, D] → [batch, H*D]
+        output.copy_(out.reshape(batch_size, num_heads * head_dim))
+        return output
+
+    def _sdpa_dense_prefill(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dense SDPA for D=512 prefill (eager only, no CUDA graph).
+
+        Per-sequence loop with bottom-right-aligned causal mask for
+        chunked prefill. Not graph-safe (dynamic shapes) but prefill
+        is never captured in a CUDA graph.
+        """
+        import torch.nn.functional as F
+
+        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+        block_size = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_dim = key_cache.shape[3]
+        num_heads = self.num_heads
+
+        # Gather full KV for all sequences
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+        k_dense_all = key_cache[block_table]  # [batch, max_b, bs, hkv, d]
+        v_dense_all = value_cache[block_table]
+
+        # Dequantize while contiguous (view requires contig)
+        k_dense_all, v_dense_all = _dequantize_fp8_contiguous_kv(
+            k_dense_all, v_dense_all, self.kv_cache_dtype,
+            float(layer._k_scale_float), float(layer._v_scale_float),
+        )
+
+        max_seq = k_dense_all.shape[1] * k_dense_all.shape[2]
+        k_dense_all = k_dense_all.reshape(
+            k_dense_all.shape[0], max_seq, num_kv_heads, head_dim
+        ).permute(0, 2, 1, 3).contiguous().to(query.dtype)
+        v_dense_all = v_dense_all.reshape(
+            v_dense_all.shape[0], max_seq, num_kv_heads, head_dim
+        ).permute(0, 2, 1, 3).contiguous().to(query.dtype)
+
+        # Per-sequence loop
+        qsl = attn_metadata.query_start_loc
+        for i in range(qsl.shape[0] - 1):
+            q_start = int(qsl[i])
+            q_end = int(qsl[i + 1])
+            q_len = q_end - q_start
+            kv_len = int(seq_lens[i])
+            if q_len == 0 or kv_len == 0:
+                continue
+
+            q_i = query[q_start:q_end].reshape(q_len, num_heads, head_dim).unsqueeze(0)
+            k_i = k_dense_all[i, :, :kv_len]  # [hkv, kv_len, d]
+            v_i = v_dense_all[i, :, :kv_len]
+
+            if num_kv_heads != num_heads:
+                rep = num_heads // num_kv_heads
+                k_i = k_i.repeat_interleave(rep, dim=0).unsqueeze(0)
+                v_i = v_i.repeat_interleave(rep, dim=0).unsqueeze(0)
+            else:
+                k_i = k_i.unsqueeze(0)
+                v_i = v_i.unsqueeze(0)
+
+            if q_len == kv_len:
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i, is_causal=True, scale=self.scale
+                )
+            else:
+                # Chunked prefill: bottom-right-aligned causal mask
+                dev = q_i.device
+                q_idx = torch.arange(q_len, device=dev).unsqueeze(1)
+                kv_idx = torch.arange(kv_len, device=dev).unsqueeze(0)
+                attn_mask = kv_idx <= (kv_len - q_len + q_idx)
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_i, v_i, attn_mask=attn_mask, scale=self.scale
+                )
+
+            output[q_start:q_end] = out_i.squeeze(0).reshape(q_len, num_heads * head_dim)
+
+        return output
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -6612,6 +6783,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_flash_v100_prefill_paged,
             self.use_triton_prefill,
         )
+
+        # D=512: route to graph-safe dense SDPA (native paged kernel has
+        # multi-block correctness bug). Decode is graph-safe (fixed shapes);
+        # prefill is eager-only (dynamic per-sequence loop).
+        if self._sdpa_dense_enabled:
+            _record_route("sdpa_dense_d512")
+            if is_prefill:
+                return self._sdpa_dense_prefill(
+                    layer, query, key, value, kv_cache, attn_metadata, output
+                )
+            return self._sdpa_dense_decode(
+                layer, query, kv_cache, attn_metadata, output
+            )
 
         if is_prefill:
             available_query_tokens = min(

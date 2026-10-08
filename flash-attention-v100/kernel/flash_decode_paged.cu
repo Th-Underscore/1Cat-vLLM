@@ -1067,14 +1067,34 @@ __global__ void flash_attention_decode_partition_kernel(
     return;
   }
 
+  const int64_t tmp_out_base =
+      static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
+      static_cast<int64_t>(head_idx) * tmp_out_stride1 +
+      static_cast<int64_t>(partition_idx) * tmp_out_stride2;
+  const int64_t stats_index =
+      static_cast<int64_t>(batch_idx) * stats_stride0 +
+      static_cast<int64_t>(head_idx) * stats_stride1 + partition_idx;
+
   const int seq_len = seq_lens[batch_idx];
   if (!xqa_seq_len_route_active<SEQ_LEN_ROUTE>(seq_len, route_seq_len_begin,
-                                               route_seq_len_end,
-                                               route_seq_len_final)) {
+                                                 route_seq_len_end,
+                                                 route_seq_len_final)) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+      tmp_out[tmp_out_base + d] = __float2half(0.f);
+    if (threadIdx.x == 0) {
+      max_logits[stats_index] = -1.0e20f;
+      exp_sums[stats_index] = 0.f;
+    }
     return;
   }
   const int start_token_idx = partition_idx * PARTITION_SIZE;
   if (seq_len <= 0 || start_token_idx >= seq_len) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+      tmp_out[tmp_out_base + d] = __float2half(0.f);
+    if (threadIdx.x == 0) {
+      max_logits[stats_index] = -1.0e20f;
+      exp_sums[stats_index] = 0.f;
+    }
     return;
   }
   const int runtime_num_partitions = active_num_partitions[0];
@@ -1083,6 +1103,12 @@ __global__ void flash_attention_decode_partition_kernel(
   const int effective_num_partitions =
       min(max_num_partitions, max(runtime_num_partitions, seq_num_partitions));
   if (partition_idx >= effective_num_partitions) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+      tmp_out[tmp_out_base + d] = __float2half(0.f);
+    if (threadIdx.x == 0) {
+      max_logits[stats_index] = -1.0e20f;
+      exp_sums[stats_index] = 0.f;
+    }
     return;
   }
 
@@ -1113,18 +1139,10 @@ __global__ void flash_attention_decode_partition_kernel(
                                 ? softmax_scale
                                 : softmax_scale * k_scale;
 
-  const int64_t tmp_out_base =
-      static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
-      static_cast<int64_t>(head_idx) * tmp_out_stride1 +
-      static_cast<int64_t>(partition_idx) * tmp_out_stride2;
   if (part_start >= part_end) {
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
       tmp_out[tmp_out_base + d] = __float2half(0.f);
-    }
     if (threadIdx.x == 0) {
-      const int64_t stats_index =
-          static_cast<int64_t>(batch_idx) * stats_stride0 +
-          static_cast<int64_t>(head_idx) * stats_stride1 + partition_idx;
       max_logits[stats_index] = -1.0e20f;
       exp_sums[stats_index] = 0.f;
     }
