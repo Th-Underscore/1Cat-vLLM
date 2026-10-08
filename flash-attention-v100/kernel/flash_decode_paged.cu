@@ -5149,6 +5149,9 @@ at::Tensor flash_attention_decode_paged(
     case 256:
       LAUNCH_BY_PARTITION(256);
       break;
+    case 512:
+      LAUNCH_BY_PARTITION(512);
+      break;
     default:
       TORCH_CHECK(false, "Unsupported head_dim for paged decode: ", head_dim);
   }
@@ -6351,6 +6354,9 @@ at::Tensor flash_attention_decode_qk_scores(
       break;
     case 256:
       LAUNCH_BY_PARTITION(256);
+      break;
+    case 512:
+      LAUNCH_BY_PARTITION(512);
       break;
     default:
       TORCH_CHECK(false, "Unsupported head_dim for paged decode: ", head_dim);
