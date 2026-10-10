@@ -5160,6 +5160,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # has a multi-block correctness bug, so D=512 layers use dense SDPA
         # with a pre-allocated fixed-shape buffer (graph-safe for decode).
         self._sdpa_dense_enabled = head_size > 256
+        if self._sdpa_dense_enabled:
+            logger.warning(
+                "FLASH_ATTN_V100: head_dim=%d routed to dense SDPA. "
+                "KNOWN LIMITATION: long-context quality degrades (>100 tokens). "
+                "No --enforce-eager workaround exists for this path — "
+                "the bug is in the SDPA computation itself, not graph capture.",
+                head_size,
+            )
         self._sdpa_dense_max_seq: int = 0  # set on first forward call
         self.use_flash_v100_prefill_paged = (
             self.flash_attn_prefill_paged is not None
