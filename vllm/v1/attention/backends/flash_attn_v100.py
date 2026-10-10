@@ -7512,6 +7512,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 query.shape[-1],
             )
             type(self)._logged_sdpa_fallback = True
+            if not torch.cuda.is_current_stream_capturing():
+                logger.warning(
+                    "FLASH_ATTN_V100: SDPA fallback is NOT CUDA-graph-safe. "
+                    "Without --enforce-eager, full-attention output is silently "
+                    "zeroed during CUDA graph replay, destroying quality at long "
+                    "context (~6x speed loss). Run with --enforce-eager for correct output."
+                )
 
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
         block_size = key_cache.shape[1]
